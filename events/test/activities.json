@@ -1,0 +1,58 @@
+{
+  "activities": [
+    {
+      "id": "quiz_capital",
+      "type": "quiz",
+      "name": "La capitale",
+      "description": "Teste tes connaissances en géographie.",
+      "enabled": true,
+      "question": "Quelle est la capitale de la France ?",
+      "choices": [
+        "A. Lyon",
+        "B. Paris",
+        "C. Marseille",
+        "D. Lille"
+      ],
+      "answers": [
+        "B",
+        "Paris"
+      ],
+      "max_attempts": 5,
+      "rewards": {
+        "points": 10,
+        "currency": 2
+      }
+    },
+    {
+      "id": "riddle_pumpkin",
+      "type": "riddle",
+      "name": "La mystérieuse citrouille",
+      "description": "Résous cette énigme.",
+      "enabled": true,
+      "question": "Je suis orange, je pousse dans un champ et on me creuse pour Halloween. Qui suis-je ?",
+      "answers": [
+        "citrouille",
+        "une citrouille",
+        "la citrouille"
+      ],
+      "max_attempts": 5,
+      "rewards": {
+        "points": 15,
+        "currency": 3
+      }
+    },
+    {
+      "id": "daily_candy",
+      "type": "command",
+      "name": "Bonbon quotidien",
+      "description": "Réclame ta récompense quotidienne.",
+      "enabled": true,
+      "cooldown_seconds": 86400,
+      "repeatable": true,
+      "rewards": {
+        "points": 5,
+        "currency": 1
+      }
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "id": "test2",
+  "name": "test2",
+  "description": "Un événement mystérieux pour Halloween.",
+  "enabled": true,
+  "start_date": "2026-10-01T00:00:00",
+  "end_date": "2026-11-01T23:59:59",
+  "currency": "bonbons"
+}

@@ -1,0 +1,6 @@
+{
+  "events_directory": "events",
+  "database_directory": "database",
+  "registry_database": "database/engine.db",
+  "command_prefix": "*"
+}
