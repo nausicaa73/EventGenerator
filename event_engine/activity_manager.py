@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from event_engine.database import connect
+from event_engine.outcome_engine import execute_outcome
 
 
 ACTIVITY_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
@@ -362,14 +363,10 @@ class ActivityManager:
         activity_id: str,
     ) -> dict:
         activity = self.get_activity(event_id, activity_id)
-
         if activity is None:
             raise ValueError("Cette activité n'existe pas ou est désactivée.")
-
         if activity["type"] != "command":
-            raise ValueError(
-                "Cette activité ne peut pas être lancée avec cette commande."
-            )
+            raise ValueError("Cette activité ne peut pas être lancée avec cette commande.")
 
         database_path = self._get_database(guild_id, event_id)
         now = int(time.time())
@@ -377,78 +374,59 @@ class ActivityManager:
 
         with connect(database_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
-
             player = connection.execute(
-                "SELECT 1 FROM players WHERE user_id = ?",
-                (user_id,),
+                "SELECT points, currency FROM players WHERE user_id = ?", (user_id,)
             ).fetchone()
-
             if player is None:
                 return {"status": "not_joined"}
 
             connection.execute(
-                """
-                INSERT OR IGNORE INTO activity_state
-                    (user_id, activity_id)
-                VALUES (?, ?)
-                """,
+                "INSERT OR IGNORE INTO activity_state (user_id, activity_id) VALUES (?, ?)",
                 (user_id, activity_id),
             )
-
             state = connection.execute(
-                """
-                SELECT completed_at, last_claimed_at
-                FROM activity_state
-                WHERE user_id = ? AND activity_id = ?
-                """,
+                "SELECT completed_at, last_claimed_at FROM activity_state "
+                "WHERE user_id = ? AND activity_id = ?",
                 (user_id, activity_id),
             ).fetchone()
-
             repeatable = activity.get("repeatable", True)
-
             if state["completed_at"] and not repeatable:
                 return {"status": "completed"}
 
             cooldown = activity.get("cooldown_seconds", 86400)
             last_claimed = state["last_claimed_at"]
-
             if last_claimed is not None:
                 remaining = cooldown - (now - last_claimed)
-
                 if remaining > 0:
-                    return {
-                        "status": "cooldown",
-                        "remaining": remaining,
-                    }
+                    return {"status": "cooldown", "remaining": remaining}
+
+            if "outcomes" in activity:
+                result = execute_outcome(connection, user_id, activity, player)
+                history_details = {
+                    "outcome": result["outcome"],
+                    "rewards": result["rewards"],
+                    "balances": result["balances"],
+                }
+            else:
+                self._reward(connection, user_id, activity, activity_id, "command_claimed")
+                result = {"status": "success", "rewards": activity.get("rewards", {})}
+                history_details = result["rewards"]
 
             connection.execute(
-                """
-                UPDATE activity_state
-                SET last_claimed_at = ?,
-                    completed_at = CASE
-                        WHEN ? THEN ?
-                        ELSE completed_at
-                    END
-                WHERE user_id = ? AND activity_id = ?
-                """,
-                (
-                    now,
-                    int(not repeatable),
-                    now_text,
-                    user_id,
-                    activity_id,
-                ),
+                """UPDATE activity_state
+                   SET last_claimed_at = ?,
+                       completed_at = CASE WHEN ? THEN ? ELSE completed_at END
+                   WHERE user_id = ? AND activity_id = ?""",
+                (now, int(not repeatable), now_text, user_id, activity_id),
             )
 
-            self._reward(
-                connection,
-                user_id,
-                activity,
-                activity_id,
-                "command_claimed",
-            )
+            if "outcomes" in activity:
+                connection.execute(
+                    """INSERT INTO activity_history
+                       (user_id, activity_id, event_type, details)
+                       VALUES (?, ?, 'command_claimed', ?)""",
+                    (user_id, activity_id, json.dumps(history_details, ensure_ascii=False)),
+                )
 
-        return {
-            "status": "success",
-            "rewards": activity.get("rewards", {}),
-        }
+        return result
+

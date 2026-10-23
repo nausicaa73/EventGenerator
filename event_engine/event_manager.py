@@ -107,6 +107,65 @@ class EventManager:
     def get_event(self, event_id: str) -> dict | None:
         return self.events.get(event_id)
 
+    def _event_has_ended(self, event_id: str) -> bool:
+        """Vrai si la date de fin de l'événement est dépassée.
+
+        Une date seule (AAAA-MM-JJ) inclut toute la journée indiquée.
+        Une date avec heure est comparée précisément.
+        """
+        event = self.get_event(event_id)
+        if not event or not event.get("end_date"):
+            return False
+
+        value = event["end_date"]
+        try:
+            end = datetime.fromisoformat(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Date invalide dans l'événement : end_date") from exc
+
+        if len(value) == 10:
+            from datetime import date
+            return date.today() > end.date()
+
+        from datetime import timezone
+        now = datetime.now(timezone.utc) if end.tzinfo else datetime.now()
+        if end.tzinfo:
+            end = end.astimezone(timezone.utc)
+        return now > end
+
+    def _mark_expired_instances(self, guild_id: int | None = None) -> None:
+        """Passe automatiquement les instances dépassées à l'état finished."""
+        query = "SELECT id, guild_id, event_id FROM event_instances WHERE status = 'active'"
+        params = ()
+        if guild_id is not None:
+            query += " AND guild_id = ?"
+            params = (str(guild_id),)
+        with connect(self.registry_path) as connection:
+            rows = connection.execute(query, params).fetchall()
+            expired_ids = []
+            for row in rows:
+                try:
+                    expired = self._event_has_ended(row["event_id"])
+                except ValueError:
+                    expired = False
+                if expired:
+                    expired_ids.append(row["id"])
+            if expired_ids:
+                connection.executemany(
+                    "UPDATE event_instances SET status = 'finished' WHERE id = ?",
+                    [(instance_id,) for instance_id in expired_ids],
+                )
+
+    def stop_event(self, guild_id: int, event_id: str) -> bool:
+        """Arrête une instance active sans supprimer ses données."""
+        with connect(self.registry_path) as connection:
+            cursor = connection.execute(
+                """UPDATE event_instances SET status = 'finished'
+                   WHERE guild_id = ? AND event_id = ? AND status = 'active'""",
+                (str(guild_id), event_id),
+            )
+        return cursor.rowcount > 0
+
     def start_event(self, guild_id: int, event_id: str) -> Path:
         event = self.get_event(event_id)
 
@@ -116,37 +175,21 @@ class EventManager:
         if not event.get("enabled", True):
             raise ValueError("Cet événement est désactivé.")
 
-        if not event.get("repeatable", False):
-            raise ValueError("Cet événement n'est pas répétable.")
+        start_value = event.get("start_date")
+        if start_value:
+            try:
+                start = datetime.fromisoformat(start_value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Date invalide dans l'événement : start_date") from exc
+            from datetime import timezone
+            now = datetime.now(timezone.utc) if start.tzinfo else datetime.now()
+            if start.tzinfo:
+                start = start.astimezone(timezone.utc)
+            if now < start:
+                raise ValueError("Cet événement n'est pas encore disponible.")
 
-        now = datetime.now()
-
-        for key, label in (
-            ("start_date", "Cet événement n'est pas encore disponible."),
-            ("end_date", "La période de lancement de cet événement est terminée."),
-        ):
-            value = event.get(key)
-
-            if value:
-                try:
-                    date = datetime.fromisoformat(value)
-                except (TypeError, ValueError) as exc:
-                    raise ValueError(
-                        f"Date invalide dans l'événement : {key}"
-                    ) from exc
-
-                if date.tzinfo is not None:
-                    from datetime import timezone
-                    current_time = datetime.now(timezone.utc)
-                    date = date.astimezone(timezone.utc)
-                else:
-                    current_time = now
-
-                if key == "start_date" and current_time < date:
-                    raise ValueError(label)
-
-                if key == "end_date" and current_time > date:
-                    raise ValueError(label)
+        if self._event_has_ended(event_id):
+            raise ValueError("La période de cet événement est terminée.")
 
         guild_text = str(guild_id)
         database_path = self.database_dir / f"{guild_text}_{event_id}.db"
@@ -207,6 +250,11 @@ class EventManager:
                 f"Événement inconnu ou désactivé : {event_id}"
             )
 
+        if self._event_has_ended(event_id):
+            self.stop_event(guild_id, event_id)
+            raise ValueError("Cet événement est terminé : sa date de fin est dépassée.")
+
+        self._mark_expired_instances(guild_id)
         with connect(self.registry_path) as connection:
             instance = connection.execute(
                 """
@@ -285,26 +333,26 @@ class EventManager:
         guild_id: int,
         event_id: str,
         limit: int = 10,
+        sort_by: str = "points",
     ) -> list:
-        """Retourne les meilleurs joueurs de l'événement."""
+        """Retourne le classement par points ou par monnaie."""
+        if sort_by not in ("points", "currency"):
+            raise ValueError("Le classement doit être trié par 'points' ou 'currency'.")
 
-        database_path = self.get_active_instance_database(
-            guild_id,
-            event_id,
-        )
-
+        database_path = self.get_active_instance_database(guild_id, event_id)
+        # sort_by est limité à une liste blanche, donc utilisable dans la requête SQL.
         with connect(database_path) as connection:
             return connection.execute(
-                """
-                SELECT user_id, points, currency
-                FROM players
-                ORDER BY points DESC, joined_at ASC, user_id ASC
-                LIMIT ?
-                """,
+                f"""SELECT user_id, points, currency
+                    FROM players
+                    ORDER BY {sort_by} DESC, joined_at ASC, user_id ASC
+                    LIMIT ?""",
                 (limit,),
             ).fetchall()
+
     def get_active_event_ids(self, guild_id: int) -> list[str]:
         """Liste les événements actifs sur un serveur."""
+        self._mark_expired_instances(guild_id)
 
         with connect(self.registry_path) as connection:
             rows = connection.execute(
@@ -332,6 +380,7 @@ class EventManager:
         user_id: int,
     ) -> list[str]:
         """Liste les événements actifs auxquels le joueur est inscrit."""
+        self._mark_expired_instances(guild_id)
 
         with connect(self.registry_path) as connection:
             instances = connection.execute(

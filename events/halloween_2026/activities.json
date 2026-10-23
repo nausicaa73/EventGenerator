@@ -1,0 +1,72 @@
+{
+  "activities": [
+    {
+  "id": "bonbon",
+  "type": "command",
+  "name": "La récolte de bonbons",
+  "description": "Tente ta chance auprès des esprits pour gagner des bonbons.",
+  "enabled": true,
+  "repeatable": true,
+  "cooldown_seconds": 3600,
+  "outcomes": [
+    {
+      "id": "success",
+      "probability": 75,
+      "messages": [
+        "Les esprits sont de votre côté cette nuit, vous avez gagné {currency_amount} bonbons !",
+        "La récolte est bonne ! Vous repartez avec {currency_amount} bonbons."
+      ],
+      "rewards": [
+        {"type": "currency", "values": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]}
+      ]
+    },
+    {
+      "id": "failure",
+      "probability": 25,
+      "branches": [
+        {
+          "conditions": [
+            {"type": "balance", "currency": "currency", "operator": "gt", "value": 10}
+          ],
+          "rewards": [
+            {"type": "currency", "values": [-1, -2, -3, -4, -5, -6], "limit_to_balance": true}
+          ],
+          "messages": [
+            "Pas de bonbons pour vous ce soir, au contraire, les esprits en veulent pour ne pas vous hanter. Vous avez perdu {currency_amount} bonbons.",
+            "Les esprits vous ont repéré ! Ils vous prennent {currency_amount} bonbons pour vous laisser tranquille."
+          ],
+          "images": [
+            "images/horreur1.png",
+            "images/horreur2.png",
+            "images/horreur3.png",
+            "images/horreur4.png",
+            "images/horreur5.png",
+            "images/horreur6.png"
+          ]
+        },
+        {
+          "conditions": [
+            {"type": "balance", "currency": "currency", "operator": "lte", "value": 10}
+          ],
+          "rewards": [
+            {"type": "currency", "values": [0]}
+          ],
+          "messages": [
+            "Pas de bonbons pour vous ce soir, au contraire, les esprits en veulent pour ne pas vous hanter.",
+            "Vous repartez les mains vides… Les esprits vous épargnent pour cette fois."
+          ],
+          "images": [
+            "images/horreur1.png",
+            "images/horreur2.png",
+            "images/horreur3.png",
+            "images/horreur4.png",
+            "images/horreur5.png",
+            "images/horreur6.png"
+          ]
+        }
+      ]
+    }
+  ]
+}
+  ]
+}
