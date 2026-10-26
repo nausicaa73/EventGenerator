@@ -35,6 +35,27 @@ class EventManager:
         self._load_events()
 
         initialize_registry(self.registry_path)
+        self._ensure_registry_migrations()
+
+    def _ensure_registry_migrations(self) -> None:
+        """Ajoute les colonnes de suivi manquantes sans toucher aux données existantes."""
+        with connect(self.registry_path) as connection:
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(event_instances)")
+            }
+            if "ended_at" not in columns:
+                connection.execute(
+                    "ALTER TABLE event_instances ADD COLUMN ended_at TEXT"
+                )
+            # Les anciennes instances déjà terminées n'ont pas de date d'arrêt
+            # historisée. On les marque à la date de migration plutôt que de les
+            # laisser avec un champ vide ; les nouveaux arrêts enregistrent l'heure exacte.
+            connection.execute(
+                """UPDATE event_instances
+                   SET ended_at = CURRENT_TIMESTAMP
+                   WHERE status = 'finished' AND ended_at IS NULL"""
+            )
 
     def _safe_path(self, relative_path: str) -> Path:
         path = (self.project_dir / relative_path).resolve()
@@ -152,7 +173,10 @@ class EventManager:
                     expired_ids.append(row["id"])
             if expired_ids:
                 connection.executemany(
-                    "UPDATE event_instances SET status = 'finished' WHERE id = ?",
+                    """UPDATE event_instances
+                       SET status = 'finished',
+                           ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP)
+                       WHERE id = ?""",
                     [(instance_id,) for instance_id in expired_ids],
                 )
 
@@ -160,7 +184,8 @@ class EventManager:
         """Arrête une instance active sans supprimer ses données."""
         with connect(self.registry_path) as connection:
             cursor = connection.execute(
-                """UPDATE event_instances SET status = 'finished'
+                """UPDATE event_instances
+                   SET status = 'finished', ended_at = CURRENT_TIMESTAMP
                    WHERE guild_id = ? AND event_id = ? AND status = 'active'""",
                 (str(guild_id), event_id),
             )
@@ -340,12 +365,15 @@ class EventManager:
             raise ValueError("Le classement doit être trié par 'points' ou 'currency'.")
 
         database_path = self.get_active_instance_database(guild_id, event_id)
-        # sort_by est limité à une liste blanche, donc utilisable dans la requête SQL.
+        # La métrique choisie est prioritaire ; l'autre sert de départage.
+        # Les colonnes proviennent d'une liste blanche, jamais d'une entrée SQL libre.
+        secondary = "currency" if sort_by == "points" else "points"
         with connect(database_path) as connection:
             return connection.execute(
                 f"""SELECT user_id, points, currency
                     FROM players
-                    ORDER BY {sort_by} DESC, joined_at ASC, user_id ASC
+                    ORDER BY {sort_by} DESC, {secondary} DESC,
+                             joined_at ASC, user_id ASC
                     LIMIT ?""",
                 (limit,),
             ).fetchall()

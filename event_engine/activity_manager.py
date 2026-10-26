@@ -355,6 +355,89 @@ class ActivityManager:
             "rewards": activity.get("rewards", {}),
         }
 
+    def get_command_luck_stats(
+        self, guild_id: int, event_id: str, activity_id: str, user_id: int | None = None
+    ) -> dict:
+        """Statistiques de gain net en monnaie pour une activité à commande."""
+        database_path = self._get_database(guild_id, event_id)
+        with connect(database_path) as connection:
+            rows = connection.execute(
+                """SELECT user_id, details FROM activity_history
+                   WHERE activity_id = ? AND event_type = 'command_claimed'
+                   ORDER BY id""",
+                (activity_id,),
+            ).fetchall()
+
+        def currency_delta(row):
+            try:
+                details = json.loads(row["details"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                details = {}
+            # Ancien format : {"currency": n}; nouveau format :
+            # {"rewards": {"currency": n, ...}, "outcome": ...}.
+            rewards = details.get("rewards", details)
+            value = rewards.get("currency", 0) if isinstance(rewards, dict) else 0
+            return value if isinstance(value, (int, float)) else 0
+
+        all_deltas = [(int(row["user_id"]), currency_delta(row)) for row in rows]
+        user_deltas = [delta for uid, delta in all_deltas if uid == user_id] if user_id is not None else []
+        total = sum(delta for _, delta in all_deltas)
+        return {
+            "uses": len(user_deltas) if user_id is not None else len(all_deltas),
+            "net_gain": sum(user_deltas) if user_id is not None else total,
+            "average": (sum(user_deltas) / len(user_deltas)) if user_deltas else 0.0,
+            "server_uses": len(all_deltas),
+            "server_net_gain": total,
+            "server_average": total / len(all_deltas) if all_deltas else 0.0,
+            "deltas": user_deltas if user_id is not None else [delta for _, delta in all_deltas],
+        }
+
+    def get_evolution(self, guild_id: int, event_id: str, metric: str) -> dict[int, list[int]]:
+        """Reconstitue les soldes après chaque entrée d'historique.
+
+        Les entrées récentes d'outcome_engine enregistrent le solde exact dans
+        `balances`; les anciennes entrées ne contiennent que les variations,
+        qu'on applique au solde reconstitué.
+        """
+        if metric not in ("points", "currency"):
+            raise ValueError("La mesure doit être 'points' ou 'currency'.")
+
+        database_path = self._get_database(guild_id, event_id)
+        with connect(database_path) as connection:
+            rows = connection.execute(
+                """SELECT user_id, details FROM activity_history ORDER BY id"""
+            ).fetchall()
+
+        evolution: dict[int, list[int]] = {}
+        balances: dict[int, int] = {}
+        for row in rows:
+            user_id = int(row["user_id"])
+            try:
+                details = json.loads(row["details"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                details = {}
+            if not isinstance(details, dict):
+                details = {}
+
+            stored_balances = details.get("balances")
+            if isinstance(stored_balances, dict) and isinstance(stored_balances.get(metric), (int, float)):
+                # Le solde en base est la source la plus fiable : on ne le
+                # recalcule pas en additionnant les récompenses.
+                balances[user_id] = int(stored_balances[metric])
+            else:
+                rewards = details.get("rewards", details)
+                delta = rewards.get(metric, 0) if isinstance(rewards, dict) else 0
+                if not isinstance(delta, (int, float)):
+                    delta = 0
+                balances[user_id] = balances.get(user_id, 0) + int(delta)
+
+            evolution.setdefault(user_id, []).append(balances[user_id])
+        return evolution
+
+    def get_points_evolution(self, guild_id: int, event_id: str) -> dict[int, list[int]]:
+        """Compatibilité avec les appels/tests existants."""
+        return self.get_evolution(guild_id, event_id, "points")
+
     def claim_command(
         self,
         guild_id: int,

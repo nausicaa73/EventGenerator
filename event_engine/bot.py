@@ -1,4 +1,6 @@
 import discord
+import io
+import json
 import re
 from discord.ext import commands
 
@@ -272,6 +274,8 @@ class EventCommands(commands.Cog):
             "`*event profile [ID] [joueur]` — Afficher un profil (mention ou ID Discord)\n"
             "Exemples : `*event profile`, `*event profile @Joueur`, `*event profile halloween_2026 @Joueur`, `*event profile 123456789012345678 halloween_2026`\n"
             "`*event ranking [ID] [points|monnaie]` — Afficher le classement, par points par défaut\n"
+            "`*event luck ACTIVITÉ [ID] [joueur]` — Comparer le gain moyen d’un joueur à celui du serveur\n"
+            "`*event evolution [ID]` — Graphique de progression des points par action d’activité\n"
             "Exemples : `*event ranking`, `*event ranking bonbons`, `*event ranking halloween_2026 bonbons`\n\n"
             "**Activités**\n"
             "`*event activities [ID]` — Lister les activités d'un événement\n"
@@ -373,7 +377,7 @@ class EventCommands(commands.Cog):
             f"Base de données créée : `{database_path.name}`"
         )
 
-    @event.command(name="stop", aliases=["end", "stopper", "close"])
+    @event.command(name="stop", aliases=["end", "stopper"])
     @commands.guild_only()
     @commands.has_guild_permissions(manage_guild=True)
     async def event_stop(self, ctx, event_id: str | None = None):
@@ -541,14 +545,21 @@ class EventCommands(commands.Cog):
         sort_by = "points"
         event_id = None
 
-        # Syntaxes : ranking ; ranking bonbons ; ranking ID ; ranking ID bonbons
+        # Syntaxes : ranking ; ranking monnaie ; ranking ID ; ranking ID monnaie.
+        # Le libellé de monnaie est lu dans la configuration de chaque événement.
+        known_currency_labels = {
+            str(self.manager.get_event(eid).get("currency", "monnaie")).casefold()
+            for eid in active_ids
+            if self.manager.get_event(eid)
+        }
+        sort_aliases = {"points", "point", "currency", "monnaie", "money", "devise"}
         if first in active_ids:
             event_id = first
             if second:
                 sort_by = second.casefold()
         elif first:
             possible_sort = first.casefold()
-            if possible_sort in ("points", "point", "currency", "monnaie", "bonbons"):
+            if possible_sort in sort_aliases or possible_sort in known_currency_labels:
                 sort_by = possible_sort
             else:
                 event_id = first
@@ -565,7 +576,7 @@ class EventCommands(commands.Cog):
         currency_name = event.get("currency", "monnaie").casefold()
         if sort_by in ("point", "points"):
             sort_by = "points"
-        elif sort_by in ("currency", "monnaie", currency_name):
+        elif sort_by in ("currency", "monnaie", "money", "devise", currency_name):
             sort_by = "currency"
         else:
             await ctx.send(
@@ -617,6 +628,165 @@ class EventCommands(commands.Cog):
             )
         embed.set_footer(text="Classement des 10 meilleurs joueurs")
         await ctx.send(embed=embed)
+
+    @event.command(name="luck")
+    @commands.guild_only()
+    async def event_luck(
+        self, ctx, activity_id: str, second: str | None = None, third: str | None = None
+    ):
+        """Compare le gain net moyen d'une activité avec la moyenne du serveur."""
+        member_pattern = re.compile(r"^<@!?(\d+)>$")
+
+        async def resolve_member(token):
+            if not token:
+                return None
+            match = member_pattern.fullmatch(token)
+            raw_id = match.group(1) if match else token
+            if not raw_id.isdigit():
+                return None
+            member_id = int(raw_id)
+            member = ctx.guild.get_member(member_id)
+            if member is None:
+                try:
+                    member = await ctx.guild.fetch_member(member_id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    return None
+            return member
+
+        target = ctx.author
+        event_id = None
+        for token in (second, third):
+            member = await resolve_member(token)
+            if member is not None:
+                target = member
+            elif token is not None:
+                event_id = token
+
+        event_id = await self.resolve_event_id(
+            ctx, event_id, joined_only=False, command_name="luck"
+        )
+        if event_id is None:
+            return
+        activity = self.activities.get_activity(event_id, activity_id)
+        if activity is None or activity.get("type") != "command":
+            await ctx.send(f"`{activity_id}` n'est pas une activité à commande de cet événement.")
+            return
+        try:
+            stats = self.activities.get_command_luck_stats(
+                ctx.guild.id, event_id, activity_id, target.id
+            )
+        except (ValueError, OSError) as error:
+            await ctx.send(f"Impossible de calculer les statistiques : {error}")
+            return
+
+        event = self.manager.get_event(event_id)
+        currency = event.get("currency", "monnaie")
+        embed = discord.Embed(
+            title=f"Chance — {activity.get('name', activity_id)}",
+            description=f"Statistiques de **{target.display_name}** comparées au serveur.",
+            color=discord.Color.gold(),
+        )
+        embed.add_field(name="Utilisations", value=str(stats["uses"]), inline=True)
+        embed.add_field(name="Gain net total", value=f"{stats['net_gain']:g} {currency}", inline=True)
+        embed.add_field(name="Gain moyen / utilisation", value=f"{stats['average']:.2f} {currency}", inline=True)
+        embed.add_field(name="Moyenne du serveur", value=f"{stats['server_average']:.2f} {currency} ({stats['server_uses']} utilisations)", inline=True)
+        if stats["uses"]:
+            difference = stats["average"] - stats["server_average"]
+            embed.add_field(
+                name="Écart à la moyenne",
+                value=f"{'+' if difference > 0 else ''}{difference:.2f} {currency} / utilisation",
+                inline=True,
+            )
+        else:
+            embed.add_field(name="Écart à la moyenne", value="Pas encore de données pour ce joueur.", inline=True)
+        embed.set_footer(text="Le gain net inclut les pertes et les résultats à 0 ; une faible quantité d'essais reste peu représentative.")
+        await ctx.send(embed=embed)
+
+    @event.command(name="evolution")
+    @commands.guild_only()
+    async def event_evolution(self, ctx, event_id: str | None = None):
+        """Envoie deux graphiques : évolution des points et de la monnaie."""
+        event_id = await self.resolve_event_id(
+            ctx, event_id, joined_only=False, command_name="evolution"
+        )
+        if event_id is None:
+            return
+        try:
+            points = self.activities.get_evolution(ctx.guild.id, event_id, "points")
+            currency = self.activities.get_evolution(ctx.guild.id, event_id, "currency")
+        except (ValueError, OSError) as error:
+            await ctx.send(f"Impossible de lire l'historique : {error}")
+            return
+        if not points and not currency:
+            await ctx.send("Aucune action historisée pour cet événement : les graphiques apparaîtront au fil des activités.")
+            return
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            await ctx.send("Les graphiques nécessitent Matplotlib. Installe-le avec `python3 -m pip install --user matplotlib` puis relance le bot.")
+            return
+
+        event = self.manager.get_event(event_id)
+        event_name = event.get("name", event_id) if isinstance(event, dict) else event_id
+        files = []
+        try:
+            for metric, evolution, title, ylabel, filename in (
+                ("points", points, "Évolution des points", "Points cumulés", f"evolution_points_{event_id}.png"),
+                ("currency", currency, "Évolution des bonbons", "Bonbons cumulés", f"evolution_bonbons_{event_id}.png"),
+            ):
+                if not evolution:
+                    continue
+                figure, axis = plt.subplots(figsize=(10, 5.8), dpi=150)
+                max_actions = max(len(values) for values in evolution.values())
+                for user_id, values in sorted(evolution.items(), key=lambda item: item[1][-1], reverse=True):
+                    # Priorité au pseudo du membre sur le serveur ; si le membre
+                    # n'est pas en cache, on tente de le récupérer via l'API Discord.
+                    member = ctx.guild.get_member(user_id)
+                    if member is None:
+                        try:
+                            member = await ctx.guild.fetch_member(user_id)
+                        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                            member = None
+                    if member is not None:
+                        label = member.display_name
+                    else:
+                        # Repli sur le nom global du compte si le joueur a quitté
+                        # le serveur ou si Discord ne permet plus de récupérer le membre.
+                        user = ctx.bot.get_user(user_id)
+                        if user is None:
+                            try:
+                                user = await ctx.bot.fetch_user(user_id)
+                            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                                user = None
+                        label = user.name if user is not None else f"Utilisateur inconnu ({user_id})"
+                    x = list(range(1, len(values) + 1))
+                    y = list(values)
+                    if len(values) < max_actions:
+                        x.append(max_actions)
+                        y.append(values[-1])
+                    axis.step(x, y, where="post", marker="o", markersize=2.5, linewidth=1.8, label=label)
+                axis.set_title(f"{title} — {event_name}")
+                axis.set_xlabel("Nombre d'actions historisées du joueur")
+                axis.set_ylabel(ylabel)
+                axis.grid(True, linestyle="--", alpha=0.3)
+                axis.set_xlim(left=1, right=max(1, max_actions))
+                axis.legend(loc="best", fontsize=8)
+                figure.tight_layout()
+                image_buffer = io.BytesIO()
+                figure.savefig(image_buffer, format="png", facecolor="white")
+                plt.close(figure)
+                image_buffer.seek(0)
+                files.append(discord.File(image_buffer, filename=filename))
+        except Exception:
+            for file in files:
+                file.close()
+            raise
+        if files:
+            await ctx.send(content=f"Évolution de l'événement **{event_name}** (points et bonbons).", files=files)
+        else:
+            await ctx.send("Aucune donnée exploitable dans l'historique pour ces graphiques.")
 
     @event.command(name="activities")
     @commands.guild_only()
@@ -743,7 +913,7 @@ class EventCommands(commands.Cog):
         else:
             embed.add_field(
                 name="Utilisation",
-                value=f"`*event do {activity_id}`",
+                value=f"`*event {activity_id}` (ou `*event do {activity_id}`)",
                 inline=False,
             )
 
@@ -822,9 +992,13 @@ class EventCommands(commands.Cog):
         except Exception as error:
             import traceback
             traceback.print_exc()
-            await ctx.send(
-                f"Impossible de répondre ({type(error).__name__}) : {error}"
-            )
+            if isinstance(error, (ValueError, FileNotFoundError, OSError)):
+                await ctx.send(f"Impossible de traiter ta réponse : {error}")
+            else:
+                await ctx.send(
+                    "Une erreur interne est survenue pendant le traitement de ta réponse. "
+                    "Le détail a été enregistré pour diagnostic. Réessaie plus tard."
+                )
             return
         status = outcome["status"]
 
@@ -972,28 +1146,44 @@ class EventBot(commands.Bot):
         )
 
     async def on_command_error(self, ctx, error):
+        """Journalise le détail technique sans exposer les exceptions Python aux joueurs."""
+        import traceback
+
+        original = getattr(error, "original", error)
         print(
             f"[ERREUR COMMANDE] {ctx.message.content!r} : "
             f"{type(error).__name__}: {error}"
         )
+        if original is not error:
+            traceback.print_exception(type(original), original, original.__traceback__)
+        elif not isinstance(error, commands.CommandNotFound):
+            traceback.print_exception(type(error), error, error.__traceback__)
 
         if isinstance(error, commands.CommandNotFound):
             return
-
         if isinstance(error, commands.MissingPermissions):
-            await ctx.send(
-                "Tu dois disposer de la permission « Gérer le serveur »."
-            )
+            await ctx.send("Tu n'as pas la permission nécessaire pour cette commande. Pour démarrer ou arrêter un événement, il faut « Gérer le serveur ».")
+            return
+        if isinstance(error, commands.NoPrivateMessage):
+            await ctx.send("Cette commande doit être utilisée sur un serveur Discord, pas en message privé.")
+            return
+        if isinstance(error, commands.MissingRequiredArgument):
+            await ctx.send(f"Il manque un argument à la commande. Consulte `*event` pour voir la syntaxe et les exemples.")
+            return
+        if isinstance(error, commands.BadArgument):
+            await ctx.send("Un argument n'a pas le format attendu. Vérifie la syntaxe avec `*event`.")
+            return
+        if isinstance(error, commands.CheckFailure):
+            await ctx.send("Tu ne peux pas utiliser cette commande ici ou avec tes permissions actuelles.")
             return
 
-        if isinstance(error, commands.NoPrivateMessage):
-            await ctx.send(
-                "Cette commande doit être utilisée sur un serveur."
-            )
-            return
+        if isinstance(original, (ValueError, FileNotFoundError, FileExistsError, OSError)):
+            message = str(original).strip()
+            if message:
+                await ctx.send(f"La commande n'a pas pu être exécutée : {message}")
+                return
 
         await ctx.send(
-            f"Une erreur est survenue : "
-            f"`{type(error).__name__}`"
+            "Une erreur interne est survenue pendant l'exécution de la commande. "
+            "Le détail a été enregistré pour diagnostic ; réessaie plus tard."
         )
-   
